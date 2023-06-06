@@ -1,0 +1,1022 @@
+---
+title: "Replication Files for Competitor-oriented incentives "
+author: "Dmitrii Galkin"
+date: "2022-06-15"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    extra_dependencies: amsmath
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(stargazer)
+library(tidyverse)
+library(reshape2)
+library(ggplot2)
+library(stringr)
+library(Rcpp)
+library(gt)
+library(knitr)
+library(reactable)
+library(kableExtra)
+library(ggpubr)
+library(multiwayvcov)
+library(Matrix)
+library(sandwich)
+library(clubSandwich)
+library(car)
+library(NCmisc)
+library(readxl)
+library(sjstats)
+library(lme4)
+library(ggpubr)
+library(stringr)
+library(gtsummary)
+library(GLMMadaptive)
+library(plyr)
+library(specr)
+library(r2mlm)
+library(xtable)
+library(broom)
+library(texreg)
+library(bife)
+library(survival)
+library(ggeffects)
+library(modelsummary)
+library(margins)
+library(lmtest)
+library(plm)
+library(effects)
+options(modelsummary_get = "broom")
+
+theme_set(theme_bw(16))
+options(scipen=999)
+
+set.seed(1)
+```
+
+# Introduction and data preparation
+
+This script provides full details of the analysis, including all data transformations and formulas. Throughout the code we have also included several comments to provide further clarification.
+
+We first transform the data:
+
+1)  Discarding all participants who either failed the attention checks or chose outside the possible follower strategy range [0,79].
+
+2)  Adding the "slope of the linearised response function" - i.e. whether, on average, the response function for a specific contract of an individual i is decreasing or increasing. This addition helps with grouping participants.
+
+3)  Correcting the discrepancies between data entries in prolific (for example, in "Gender" category there are entries with "no data", or "DATA EXPIRED" or "Prefer not to say". These are coded as "No data")
+
+```{r read DATA}
+fulldf<-read_excel("Combined_results_clean.xlsx")
+fulldf$TimeTaken<-fulldf$TimeTaken/60 #Time taken in minutes
+fulldf<-subset(fulldf,fulldf$Attention_Checks=="TRUE") #Focusing on participants who passed attention checks
+fulldf<-tibble("playerNr"=fulldf$playerNr,"randomOrder"=fulldf$randomOrder,fulldf[grepl("firmBStrategyChoice",colnames(fulldf))],fulldf[grepl("leaderChoice",colnames(fulldf))],fulldf[grepl("attention",colnames(fulldf))],fulldf[51:58],"Bonus"=fulldf$Bonus)
+posChoices<-parse_number(colnames(fulldf[3:11])) #Finding possible leader choices
+posGrid<-data.frame("followChoice"=NA,"leaderChoice"=posChoices) 
+fulldf$slopeAP<-NA
+fulldf$slopeRP<-NA
+fulldf$above79<-NA
+fulldf[fulldf=="DATA EXPIRED"]<-"No Data"
+fulldf$`Level of Education`[fulldf$`Level of Education`==0]<-"No Data"
+
+#estimate individual slopes
+for(i in (1:nrow(fulldf))){
+  posGrid$followChoice<-unname(unlist(fulldf[i,3:11]))
+  fulldf$slopeRP[i]<-coef(lm(followChoice~leaderChoice,data=posGrid))[[2]] 
+  posGrid$followChoice<-unname(unlist(fulldf[i,12:20]))
+  fulldf$slopeAP[i]<-coef(lm(followChoice~leaderChoice,data=posGrid))[[2]]
+  fulldf$above79[i]<-sum(fulldf[i,3:20]>79)
+} #For each participants two slopes are calculated: one for APE environment, one for RPE environment. Slopes are calculated on the linearised response curves. 
+df<-subset(fulldf,fulldf$above79==0) #Omitting people who have chosen outside the possible follower strategy range [0,79]
+
+df$UPorDOWN<-ifelse(df$slopeAP<0 & df$slopeRP<0,"down",ifelse(df$slopeAP>0 & df$slopeRP>0,"up","random")) #Categorising strategies based on the slope under both environments. 
+
+df$Gender<-ifelse(df$Gender=="Prefer not to say","No Data", df$Gender) #Correcting the discrepancies in data coding from Prolific 
+
+a<-80; #Market Parameters
+c<-0;
+d<-0;
+g<-0.33;
+nSplit<-12;
+
+
+
+brGridAP<-tibble("followerChoice"=seq(1:60),"profit"=NA);
+brGridRP<-tibble("followerChoice"=seq(1:60),"profit"=NA);
+
+col_grid <- rgb(235, 235, 235, 100, maxColorValue = 255)
+
+```
+
+In this part of the code we add the functions that may be useful for additional analyses.
+
+```{r functions}
+#Function to find the profit of the leader firm
+profitL<-function(qL,qF){
+  profitL<-(a-qL-qF)*qL-c*qL
+  return(profitL)
+}
+#Function to find the profit of the follower firm
+profitF<-function(qL,qF){
+  profitF<-(a-qL-qF)*qF-c*qF
+  return(profitF)
+}
+#Function to find the payoff of the follower under RP contract (no fixed bonus)
+profitPR<-function(qL,qf){
+  asda<-profitF(qL,qf)+g*(profitF(qL,qf)-profitL(qL,qf))
+  return(asda)
+}
+
+#Function to find Best response for follower given the choice of the leader under AP
+bestResponseAP<-function(leaderChoice){
+  brGridAP[2]<-profitF(leaderChoice,brGridAP$followerChoice)
+  bestChoice<-colMeans(brGridAP[brGridAP$profit==max(brGridAP[2]),1]);
+  return(bestChoice)
+}
+
+
+#Function to find Best response for follower given the choice of the leader under RP
+bestResponseRP<-function(leaderChoice){
+  brGridRP[2]<-profitF(leaderChoice,brGridAP$followerChoice)+g*(profitF(leaderChoice,brGridRP$followerChoice)-profitL(leaderChoice,brGridRP$followerChoice))
+  bestChoice<-colMeans(brGridRP[brGridRP$profit==max(brGridRP[2]),1]);
+  return(bestChoice)
+}
+
+
+#Function to present the summary and confidence intervals
+summarySE <- function(data=NULL, measurevar, groupvars=NULL, na.rm=FALSE,
+                      conf.interval=.95, .drop=TRUE) {
+    # New version of length which can handle NA's: if na.rm==T, don't count them
+    length2 <- function (x, na.rm=FALSE) {
+        if (na.rm) sum(!is.na(x))
+        else       length(x)
+    }
+
+    # This does the summary. For each group's data frame, return a vector with
+    # N, mean, and sd
+    datac <- ddply(data, groupvars, .drop=.drop,
+      .fun = function(xx, col) {
+        c(N    = length2(xx[[col]], na.rm=na.rm),
+          mean = mean   (xx[[col]], na.rm=na.rm),
+          sd   = sd     (xx[[col]], na.rm=na.rm)
+        )
+      },
+      measurevar
+    )
+
+    # Rename the "mean" column    
+    datac <- rename(datac, c("mean" = measurevar))
+
+    datac$se <- datac$sd / sqrt(datac$N)  # Calculate standard error of the mean
+
+    # Confidence interval multiplier for standard error
+    # Calculate t-statistic for confidence interval: 
+    # e.g., if conf.interval is .95, use .975 (above/below), and use df=N-1
+    ciMult <- qt(conf.interval/2 + .5, datac$N-1)
+    datac$ci <- datac$se * ciMult
+
+    return(datac)
+}
+
+#Creating the optimal BR function for AP contract:
+optimalAP<-tibble("leader.Choice"=c(1,7,14,20,27,33,40,48,56),"valueAP"=c(40,37,33,30,27,24,20,16,12))
+optimalAP$OptimalProfitAP<-round(mapply(profitF,optimalAP$leader.Choice,optimalAP$valueAP)+100)
+
+#Creating the optimal BR function for RP contract:
+optimalRP<-tibble("leader.Choice"=c(1,7,14,20,27,33,40,48,56),"valueRP"=c(40,38,35,33,30,28,25,22,19))
+optimalRP$OptimalProfitRP<-round(mapply(profitPR,optimalRP$leader.Choice,optimalRP$valueRP)+100)
+
+optimaltable<-tibble("leader.Choice"=c(1,7,14,20,27,33,40,48,56),"valueAP"=c(40,37,33,30,27,24,20,16,12),"valueRP"=c(40,38,35,33,30,28,25,22,19))
+
+optimaltable<-melt(optimaltable,measure.vars = 2:3,value.name = "value",variable.name = "leader.Choice")
+
+#Functions to find the optimal quantity for any given choice of the leader quantity
+findOptAP<-function(lquantity){
+  return(optimalAP$valueAP[which(optimalAP$leader.Choice==lquantity)])
+}
+findOptRP<-function(lquantity){
+  return(optimalRP$valueRP[which(optimalRP$leader.Choice==lquantity)])
+}
+#Function to find the maximum profit (in experimental currency) for a specific contract and specific choice of leader quantity
+findOptimalProfit<-function(contractType,choiceL){
+  sacValue<-ifelse(contractType=="valueAP",
+                   return(optimalAP$OptimalProfitAP[which(optimalAP$leader.Choice==choiceL)]),
+                   return(optimalRP$OptimalProfitRP[which(optimalRP$leader.Choice==choiceL)]))
+}
+
+#Function to find the amount sacrificed (in experimental currency) by a participant for a specific contract type, given he responded some choiceF to a specific leader quanaity                  
+findSac<-function(contractType,choiceL,choiceF){
+  sacValue<-ifelse(contractType=="valueAP",
+                   round(optimalAP$OptimalProfitAP[which(optimalAP$leader.Choice==choiceL)]-ifelse(choiceL+choiceF<80,profitF(choiceL,choiceF)+100,0)),
+                   round(optimalRP$OptimalProfitRP[which(optimalRP$leader.Choice==choiceL)]-max((profitPR(choiceL,choiceF)+100),0)))
+  return(sacValue)
+}
+#Function to add brackets to the average quantity tables
+addBrackets<-function(alist){
+  blist<-alist;
+  for (i in 1:length(alist)){
+    blist[i]<-paste("(",as.character(alist[i]),")",sep = "")
+    
+  }
+  return(blist)
+}
+
+```
+
+In this part we melt all the data - i.e. transform it to the long format. We also extract the leader choice quantities. In addition, we add several variables:
+
+1)  Order - dichotomous variable to indicate "first exposure", i.e. value "1" indicates that the contract was played *first*.
+
+2)  onlyRational - variable to show if a particular combination of leader/follower quantities is below maximum market quanity or not.
+
+3)  deviationsFromOptimal - deviation of each observed follower quantity from the optimal choice.
+
+4)  ahead: Behind/Ahead - dichotomous variable that describes whether the participant is in the favourable position in the market or not (i.e. if the maximum quantity that is possible to achieve with optimal choice of follower quanity is larger or smaller than the resulting profit of the leader).
+
+5)  Using deviationsFromOptimal we also categorise the observed response into above optimal, optimal and below optimal. Above optimal implies that a participant sacrifices his payoff to punish the opponent, optimal implies that he/she chooses the compensation-maximising quanity and below optimal means he sacrifices his payoff to reward the opponent.\
+
+```{r melting all data}
+
+
+#creating separate tibbles for AP,RP,DIF and combined (maybe not the most efficient way)
+
+molten_df<-melt(df,measure.vars = 3:20,value.name = "value",variable.name = "leader.Choice")
+molten_df$APorRP<-as.factor(paste("value",str_sub(molten_df$leader.Choice,-2),sep=""))
+molten_df$leader.Choice<-gsub("firmBStrategyChoice","",molten_df$leader.Choice)
+molten_df$leader.Choice<-gsub("AP","",molten_df$leader.Choice)
+molten_df$leader.Choice<-gsub("RP","",molten_df$leader.Choice)
+molten_df$leader.Choice<-as.numeric(molten_df$leader.Choice)
+molten_df$Order<-ifelse((molten_df$randomOrder==0 & molten_df$APorRP=="valueAP")|(molten_df$randomOrder==1 & molten_df$APorRP=="valueRP"),1,0)# If the randomOrder=0, then the participant started with AP contract. Thus, this variable indicates "first exposure".
+molten_df$onlyRational<-ifelse(molten_df$leader.Choice+molten_df$value<80,1,0) #1 if total output is smaller than 80,0 if total output is larger than 80
+molten_df$deviationsFromOptimal<-ifelse(molten_df$APorRP=="valueAP",molten_df$value-mapply(findOptAP,molten_df$leader.Choice),molten_df$value-mapply(findOptRP,molten_df$leader.Choice)) #find the deviations from optimal quantity
+
+#different threshold checks
+molten_df$ahead<-ifelse(molten_df$leader.Choice<27,"ahead","behind") #
+molten_df$ahead<-ifelse(molten_df$leader.Choice==27,ifelse(molten_df$APorRP=="valueRP","ahead","behind"),molten_df$ahead)
+
+
+
+#Categorising the strategy, as above optimal, optimal or below optimal choice. We are allowing for tiny mistakes (+ or -) from the optimum.
+threshold<-(1)
+molten_df$punish<-ifelse(molten_df$deviationsFromOptimal>threshold,1,0) #punish if deviations from optimal is larger than 1(positive+1)
+molten_df$prmax<-ifelse(molten_df$deviationsFromOptimal<(threshold+1) & molten_df$deviationsFromOptimal>(-threshold-1),1,0) #optimal choice +- 1
+molten_df$reward<-ifelse(molten_df$deviationsFromOptimal<(-threshold),1,0) #reward if deviations from optimal is smaller than -1(negative - 1 )
+molten_df$posOptimal<-ifelse(molten_df$deviationsFromOptimal>threshold,"Above optimal",ifelse(molten_df$deviationsFromOptimal<(-threshold),"Below optimal","Optimal"))
+
+#Categorising the strategy, as above optimal, optimal or below optimal choice. We are allowing for tiny mistakes (+ or -) from the optimum. This specific categorisation is slightly more precise (i.e. it also groups people who "punished" into "limit above optimal - i.e. their observed choice inflicts maximum punishment without going over the maximum market quantity; and "extreme above optimal" - where they exceed the maximum market quantity which results in 0 payments to both leader/follower )
+molten_df$posOptimalEx<-molten_df$posOptimal
+molten_df$posOptimalEx<-ifelse(molten_df$posOptimal=="Above optimal",
+                               ifelse(molten_df$value+molten_df$leader.Choice>78 & molten_df$value+molten_df$leader.Choice<80,
+                                      "Limit above optimal",ifelse(molten_df$value+molten_df$leader.Choice>80,
+                                                                   "Extreme above optimal",molten_df$posOptimalEx)),
+                               molten_df$posOptimalEx)
+molten_df$posOptimalEx<-factor(molten_df$posOptimalEx,levels=c("Extreme above optimal","Limit above optimal","Above optimal","Optimal","Below optimal"))
+molten_df$posOptimal<-factor(molten_df$posOptimal,levels=c("Above optimal","Optimal","Below optimal"))
+
+
+molten_df$RPE<-ifelse(molten_df$APorRP=="valueRP",1,0)
+molten_df$Behind<-ifelse(molten_df$ahead=="behind",1,0)
+
+  
+  
+```
+
+# Descriptive tables/graphs
+
+## Tables for demographics
+
+Here we construct tables for demographics and demographics by slope (Table 3).
+
+```{r look at indvidual responses and Demographics, message=FALSE, warning=FALSE}
+
+TableDemographics<-df%>%
+  select(Gender,Country,"Level of Education",Student,AGE,EmploymentStatus,TimeTaken,Bonus) %>%
+  tbl_summary()
+
+
+TableDemographicsBySlope<-df%>%
+  select(Gender,Country,"Level of Education",Student,AGE,EmploymentStatus,UPorDOWN,TimeTaken,Bonus) %>%
+  tbl_summary(by="UPorDOWN")%>%
+  add_overall()
+TableDemographicsBySlope
+
+#Entrire table
+#TableDemographics<-as_kable_extra(TableDemographics, format = "latex")
+TableDemographicsBySlope<-as_kable_extra(TableDemographicsBySlope, format = "latex")
+
+```
+
+In this part we create tables for mean observed quantities for the entire sample and specific subgroups. These are later used to produce the graphs for the average observed quantities with 95% confidence intervals for the means.
+
+```{r creating tables: entire sample, echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+pd <- position_dodge(0.2) # move them .05 to the left and right
+
+summaryTableEntireSample<-summarySE(molten_df,measurevar = "value", groupvars = c("APorRP", "leader.Choice"))
+summaryTableOrder<-summarySE(subset(molten_df,molten_df$Order==1),measurevar = "value", groupvars = c("APorRP", "leader.Choice"))
+summaryTableOnlyDown<-summarySE(subset(molten_df,molten_df$UPorDOWN=="down"),measurevar = "value", groupvars = c("APorRP", "leader.Choice"))
+summaryTableOnlyUp<-summarySE(subset(molten_df,molten_df$UPorDOWN=="up"),measurevar = "value", groupvars = c("APorRP", "leader.Choice"))
+summaryTableOnlyRandom<-summarySE(subset(molten_df,molten_df$UPorDOWN=="random"),measurevar = "value", groupvars = c("APorRP", "leader.Choice"))
+
+wideTable1<-summaryTableEntireSample %>% 
+  select("APorRP","leader.Choice","value","se")%>% #selecting the variable from the summary table
+  gather("value","se",key = variable, value = number) %>% 
+  spread(leader.Choice,number)%>% #This creates a table from summarySE
+  mutate_if(is.numeric, round,digits=2) #rounding to 3 digits
+#cfTEST<-coeftest(linearModelSE,vcov. = vcovHC(linearModelSE,type="HC2",cluster="playerNr")) #requires lmtest
+#cfTEST<-tidy(cfTEST)
+
+
+TableMeanObservations<-as.data.frame(wideTable1) #may not be ideal, but a way to get the column names from widetable
+
+TableMeanObservations[1,]<-c("valueAP","Optimal choices",as.list(as.integer(optimalAP$valueAP)))#optimal choices from AP
+TableMeanObservations[2,]<-wideTable1[2,] #mean observations AP contract
+TableMeanObservations[3,]<-c(NA,"se",addBrackets(unname(wideTable1[1,][3:11]))) #SE AP contract
+TableMeanObservations[4,]<-c("valueRP","Optimal choices",as.list(as.integer(optimalRP$valueRP)))#optimal choices from RP
+TableMeanObservations[5,]<-wideTable1[4,] #mean observations RP contract
+TableMeanObservations[6,]<-c(NA,"se",addBrackets(unname(wideTable1[3,][3:11]))) #SE RP contract
+
+
+#tables for a graph. 
+        graphTable<-summaryTableEntireSample
+        #Sorry for this code.
+        graphTable[19:36,]<-NA
+        graphTable$APorRP<-factor(c(rep("Observed AP",9),rep("Observed RP",9),rep("Optimal AP",9),rep("Optimal RP",9)), levels = c("Observed AP", "Observed RP", "Optimal AP","Optimal RP"))
+        graphTable[19:36,2]<-graphTable[1:18,2] #add leader choices for the optimal
+        graphTable[19:36,4]<-c(optimalAP$valueAP,optimalRP$valueRP)
+
+
+        graphTableDS<-summaryTableOnlyDown
+        #Sorry for this code.
+        graphTableDS[19:36,]<-NA
+        graphTableDS$APorRP<-factor(c(rep("Observed AP",9),rep("Observed RP",9),rep("Optimal AP",9),rep("Optimal RP",9)), levels = c("Observed AP", "Observed RP", "Optimal AP","Optimal RP"))
+        graphTableDS[19:36,2]<-graphTableDS[1:18,2] #add leader choices for the optimal
+        graphTableDS[19:36,4]<-c(optimalAP$valueAP,optimalRP$valueRP)
+
+        graphTableUS<-summaryTableOnlyUp
+        #Sorry for this code.
+        graphTableUS[19:36,]<-NA
+        graphTableUS$APorRP<-factor(c(rep("Observed AP",9),rep("Observed RP",9),rep("Optimal AP",9),rep("Optimal RP",9)), levels = c("Observed AP", "Observed RP", "Optimal AP","Optimal RP"))
+        graphTableUS[19:36,2]<-graphTableUS[1:18,2] #add leader choices for the optimal
+        graphTableUS[19:36,4]<-c(optimalAP$valueAP,optimalRP$valueRP)
+        
+        graphTableRandom<-summaryTableOnlyRandom
+        #Sorry for this code.
+        graphTableRandom[19:36,]<-NA
+        graphTableRandom$APorRP<-factor(c(rep("Observed AP",9),rep("Observed RP",9),rep("Optimal AP",9),rep("Optimal RP",9)), levels = c("Observed AP", "Observed RP", "Optimal AP","Optimal RP"))
+        graphTableRandom[19:36,2]<-graphTableRandom[1:18,2] #add leader choices for the optimal
+        graphTableRandom[19:36,4]<-c(optimalAP$valueAP,optimalRP$valueRP)
+        
+        
+        graphTableOF<-summaryTableOrder
+        #Sorry for this code.
+        graphTableOF[19:36,]<-NA
+        graphTableOF$APorRP<-factor(c(rep("Observed AP",9),rep("Observed RP",9),rep("Optimal AP",9),rep("Optimal RP",9)), levels = c("Observed AP", "Observed RP", "Optimal AP","Optimal RP"))
+        graphTableOF[19:36,2]<-graphTableOF[1:18,2] #add leader choices for the optimal
+        graphTableOF[19:36,4]<-c(optimalAP$valueAP,optimalRP$valueRP)
+
+```
+
+## Observed Mean graphs (Figures 2,4)
+
+In this part we construct a graph for average observed responses + 95% confidence intervals (Figure 2).
+
+```{r Graphs: average + 95 confidence intervals}
+
+averageGraphFull<-graphTable%>%
+          ggplot(aes(x=leader.Choice,y=value,colour=APorRP,linetype=APorRP,size=APorRP))+
+          geom_path()+
+          geom_point()+
+          geom_errorbar(aes(ymin=value-ci, ymax=value+ci),size=0.4,width=2, position=pd)+
+          labs(y="Follower's Response", x="Leader's choice")+
+          scale_x_continuous(breaks = scales::pretty_breaks(n = 10))+
+          scale_y_continuous(breaks = scales::pretty_breaks(n = 10),limits=c(10,40))+
+          scale_color_manual(values = c("red", "dodgerblue3", "red", "dodgerblue3")) + 
+          scale_linetype_manual(values = c(1, 1, 2, 2)) +
+          scale_size_manual(values = c(1, 1,0.4,0.4))+
+          theme(axis.title.x = element_text(color = "black", size = 12),
+                axis.title.y = element_text(color = "black", size = 12),
+                axis.text = element_text(color = "black", size = 10),
+                plot.title = element_text(size = 12),
+                legend.text = element_text(color = "black", size = 10),
+                legend.title =  element_blank(), 
+                panel.grid =  element_line(color = col_grid),
+                legend.justification=c(0.01,0.01),
+                legend.position=c(0.01,0.01))
+                            
+        averageGraphFull
+        #ggsave("observedMeanGraph.png")
+
+ molten_df %>%
+          
+          filter(APorRP %in% c("valueAP","valueRP")) %>%
+          ggplot(aes(x=as.factor(leader.Choice),y=value,fill=factor(APorRP)))+
+          geom_boxplot(outlier.size = 0.3)+
+          labs(y="Follower's Response", x="Leader's choice")+
+          theme(legend.title = element_blank())+
+          scale_fill_discrete(labels=c("AP responses","RP responses"))+
+          theme(axis.title.x = element_text(color = "black", size = 12),
+                axis.title.y = element_text(color = "black", size = 12),
+                axis.text = element_text(color = "black", size = 10),
+                plot.title = element_text(size = 14),
+                legend.text = element_text(color = "black", size = 12),
+                legend.title =  element_blank(), 
+                panel.grid =  element_line(color = col_grid))
+        ##ggsave("observedDistributions.png")
+
+```
+
+This part includes the graphs for average responses for upward-sloping and downwards-sloping groups (Figure 4).
+
+```{r additional average graphs, echo=FALSE, message=FALSE, warning=FALSE}
+#Average graph with clean comparison (i.e. comparing the responses only with exposure to either APE or RPE)
+averageGraphOF<-graphTableOF %>%
+          ggplot(aes(x=leader.Choice,y=value,colour=APorRP,linetype=APorRP,size=APorRP))+
+          geom_path()+
+          geom_point()+
+          geom_errorbar(aes(ymin=value-ci, ymax=value+ci),size=0.4,width=2, position=pd)+
+          labs(y="Follower's Response", x="Leader's choice")+
+          scale_x_continuous(breaks = scales::pretty_breaks(n = 10))+
+          scale_y_continuous(breaks = scales::pretty_breaks(n = 10),limits=c(10,40))+
+          scale_color_manual(values = c("red", "dodgerblue3", "red", "dodgerblue3")) + 
+          scale_linetype_manual(values = c(1, 1, 2, 2)) +
+          scale_size_manual(values = c(1, 1,0.4,0.4))+
+          theme(axis.title.x = element_text(color = "black", size = 12),
+                axis.title.y = element_text(color = "black", size = 12),
+                axis.text = element_text(color = "black", size = 10),
+                plot.title = element_text(size = 12),
+                legend.text = element_text(color = "black", size = 10),
+                legend.title =  element_blank(), 
+                panel.grid =  element_line(color = col_grid),
+                legend.justification=c(0.01,0.01),
+                legend.position=c(0.01,0.01))
+                            
+        
+       
+averageGraphOF
+
+
+##ggsave("averageGraphOF.png")
+##ggsave("averageGraphFull.png",averageGraphFull, scale=1,width=8, height=4,dpi=300)
+legendTextSize=12
+axisTextSize=12
+plotTitleSize=10
+averageGraphDown<-graphTableDS%>%
+  ggplot(aes(x=leader.Choice,y=value,colour=APorRP,linetype=APorRP,size=APorRP))+
+  geom_path()+
+  geom_point()+
+  ggtitle("Downward Sloping")+
+  geom_errorbar(aes(ymin=value-ci, ymax=value+ci),size=0.4,width=2, position=pd)+
+  labs(y="Follower's Response", x="Leader's choice")+
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 7))+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 7),limits=c(0,60))+
+  scale_color_manual(values = c("red", "dodgerblue3", "red", "dodgerblue3")) + 
+  scale_linetype_manual(values = c(1, 1, 2, 2)) +
+  scale_size_manual(values = c(1, 1,0.4,0.4))+
+  theme(axis.title.x = element_text(color = "black", size = axisTextSize),
+        axis.title.y = element_text(color = "black", size = axisTextSize),
+        axis.text = element_text(color = "black", size = axisTextSize),
+        plot.title = element_text(size = plotTitleSize,hjust=0.5),
+        legend.text = element_text(color = "black", size = legendTextSize),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid))
+
+averageGraphUp<-graphTableUS%>%
+  ggplot(aes(x=leader.Choice,y=value,colour=APorRP,linetype=APorRP,size=APorRP))+
+  geom_path()+
+  geom_point()+
+  ggtitle("Upward Sloping")+
+  geom_errorbar(aes(ymin=value-ci, ymax=value+ci),size=0.4,width=2, position=pd)+
+  labs(y="Follower's Response", x="Leader's choice")+
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 7))+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 7),limits=c(0,60))+
+  scale_color_manual(values = c("red", "dodgerblue3", "red", "dodgerblue3")) + 
+  scale_linetype_manual(values = c(1, 1, 2, 2)) +
+  scale_size_manual(values = c(1, 1,0.4,0.4))+
+  theme(axis.title.x = element_text(color = "black", size = axisTextSize),
+        axis.title.y = element_blank(),
+        axis.text = element_text(color = "black", size = axisTextSize),
+        plot.title = element_text(size = plotTitleSize,hjust=0.5),
+        legend.text = element_text(color = "black", size = legendTextSize),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid))
+
+averageGraphRandom<-graphTableRandom%>%
+  ggplot(aes(x=leader.Choice,y=value,colour=APorRP,linetype=APorRP,size=APorRP))+
+  geom_path()+
+  geom_point()+
+  ggtitle("Random Slopes")+
+  geom_errorbar(aes(ymin=value-ci, ymax=value+ci),size=0.4,width=2, position=pd)+
+  labs(y="Follower's Response", x="Leader's choice")+
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 7))+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 7),limits=c(0,60))+
+  scale_color_manual(values = c("red", "dodgerblue3", "red", "dodgerblue3")) + 
+  scale_linetype_manual(values = c(1, 1, 2, 2)) +
+  scale_size_manual(values = c(1, 1,0.4,0.4))+
+  theme(axis.title.x = element_text(color = "black", size = axisTextSize),
+        axis.title.y = element_blank(),
+        axis.text = element_text(color = "black", size = axisTextSize),
+        plot.title = element_text(size = plotTitleSize,hjust=0.5),
+        legend.text = element_text(color = "black", size = axisTextSize),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid))
+
+averageGraphDown
+averageGraphUp
+averageGraphRandom
+meanGraphsBySlope<-ggarrange(averageGraphDown,averageGraphUp, ncol=2, nrow=1, common.legend = TRUE, legend="bottom")
+meanGraphsBySlope
+ggsave("meanGraphsBySlope.png",meanGraphsBySlope, scale=1,width=12, height=6,dpi=300)
+#ggsave("meanGraphsUP.png",averageGraphUp, scale=1,width=12, height=6,dpi=300)
+#ggsave("meanGraphsDown.png",averageGraphDown, scale=1,width=12, height=6,dpi=300)
+#ggsave("meanGraphsRandom.png",averageGraphRandom, scale=1,width=12, height=6,dpi=300)
+
+```
+
+## Stacked Histograms - position versus optimal (compensation-maximising) choices (Figure 3)
+
+In this part we present the observed data as a stacked histogram of the relative position vs optimal choice (Figure 3).
+
+```{r Stacked Histogram, echo=TRUE, message=FALSE, warning=FALSE}
+
+stackedHistogramAP<-molten_df %>%
+  filter(APorRP=="valueAP")%>%
+  ggplot(aes(x=as.factor(leader.Choice),fill=posOptimal))+
+  geom_bar()+
+  ggtitle("AP contract")+
+  labs(y="Number of observations", x="Leader's choice")+
+  scale_fill_manual(values = c("#FF6666", "#00cc00", "#3399ff"))+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12,hjust=0.5),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+
+stackedHistogramRP<-molten_df %>%
+  filter(APorRP=="valueRP")%>%
+  ggplot(aes(x=as.factor(leader.Choice),fill=posOptimal))+
+  geom_bar()+
+  ggtitle("RP contract")+
+  labs(y="Number of observations", x="Leader's choice")+
+  scale_fill_manual(values = c("#FF6666", "#00cc00", "#3399ff"))+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12,hjust=0.5),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+
+stackedHistogramAPex<-molten_df%>%
+  filter(APorRP=="valueAP")%>%
+  ggplot(aes(x=as.factor(leader.Choice),fill=posOptimalEx))+
+  geom_bar()+
+  ggtitle("AP contract")+
+  labs(y="Number of observations", x="Leader's choice")+
+  scale_fill_manual(values = c("#990000","#FF0000","#FF6666", "#00cc00", "#3399ff"))+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12,hjust=0.5),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+stackedHistogramRPex<-molten_df%>%
+  filter(APorRP=="valueRP")%>%
+  ggplot(aes(x=as.factor(leader.Choice),fill=posOptimalEx))+
+  geom_bar()+
+  ggtitle("RP contract")+
+  labs(y="Number of observations", x="Leader's choice")+
+  scale_fill_manual(values = c("#990000","#FF0000","#FF6666", "#00cc00", "#3399ff"))+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12,hjust=0.5),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+
+arrangedHist<-ggarrange(stackedHistogramAP, stackedHistogramRP, ncol=2, nrow=1, common.legend = TRUE, legend="bottom")
+arrangedHist
+#ggsave("stackedHistogram.png",arrangedHist)
+arrangedHistOnlyex<-ggarrange(stackedHistogramAPex, stackedHistogramRPex, ncol=2, nrow=1, common.legend = TRUE, legend="bottom")
+arrangedHistOnlyex
+#ggsave("arrangedHistex.png",arrangedHistOnlyex)
+```
+## Analysis
+#### Hypothesis 1: Managers' strategies under RPE-based compensation will contain higher output quantities than managers' strategies under APE-based compensation.
+
+#### Table 1 (OLS with robust errors clustered on individual level)
+
+Here we start with the Hypothesis testing. We begin with Hypothesis 1, where we run a simple OLS with robust errors clustered at the individual level. For the computation of the cluster-robust errors we use clubSandwich (see https://cran.r-project.org/web/packages/clubSandwich/vignettes/panel-data-CRVE.html). The output is then used for Table 1. The following two equations are estimated: $$q_{bi} = \beta_0+\beta_1 RPE + \beta_2q_{a}+\beta_3(q_{a} \times RPE)+ \epsilon_i$$ $$q_{bi} = \beta_0+ \beta_1q_{a}+\beta_2(q_{a} \times RPE)+ \epsilon_i$$
+
+
+
+```{r Table 1: Linear response functions of second-movers: OLS + CLustered errors, warning=TRUE}
+#Simple regression:
+LinearRegressionPooledData<-lm(value~leader.Choice+RPE+leader.Choice:RPE,data=molten_df)
+LinearRegressionCEPooledDataCE<-sqrt(diag(vcovCR(LinearRegressionPooledData,cluster=molten_df$playerNr,type="CR2")))
+
+LinearRegressionPooledData2<-lm(value~leader.Choice+leader.Choice:RPE,data=molten_df)
+LinearRegressionCEPooledDataCE2<-sqrt(diag(vcovCR(LinearRegressionPooledData2,cluster=molten_df$playerNr,type="CR2")))
+
+vcov_matrices_1<-list(vcovCR(LinearRegressionPooledData,cluster=molten_df$playerNr,type="CR2"),vcovCR(LinearRegressionPooledData2,cluster=molten_df$playerNr,type="CR2"))
+
+table1<-modelsummary(list("Model 1"=LinearRegressionPooledData,"Model 2"=LinearRegressionPooledData2),
+             metrics="all",
+             vcov=vcov_matrices_1,
+             stars=c('*' = .05, '**' = .01,'***'=.001),
+             coef_map = c("(Intercept)"="Intercept","leader.Choice"="Qa(Leader Choice)","RPE"="RPE","leader.Choice:RPE"="RPE:Qa (Leader Choice)"),
+             gof_omit="AIC|BIC|ICC|F|RMSE|aicc|Log.Lik.|R2 Adj",
+             output="kableExtra",
+             title= "Linear response functions of second-movers.")
+table1
+```
+
+#### Robustness checks for Hyp.1 - controlling for order effects.
+
+As a robustness check, we also run the above regressions with "Order" variable. In our experimental setting, some of the participants started with APE, and some with RPE. "Order" takes the value 1 for the responses under the initial contract and 0 for the responses for the subsequent contract.
+
+Thus, we look at the pooled data while controlling for the order of contracts (models 1-2). 
+
+```{r Robustness checks - including onleFirst: Linear response functions of second-movers: OLS + CLustered errors, warning=FALSE}
+#Regressions with "order effect" on the pooled data
+LinearRegressionPooledDataRO<-lm(value~leader.Choice+RPE+leader.Choice:RPE+Order,data=molten_df)
+LinearRegressionCEPooledDataCERO<-sqrt(diag(vcovCR(LinearRegressionPooledDataRO,type="CR2",cluster=molten_df$playerNr)))
+LinearRegressionPooledData2RO<-lm(value~leader.Choice+leader.Choice:RPE+Order,data=molten_df)
+LinearRegressionCEPooledDataCE2RO<-sqrt(diag(vcovCR(LinearRegressionPooledData2RO,type="CR2",cluster=molten_df$playerNr)))
+vcov_list_withOrder<-list(vcovCR(LinearRegressionPooledDataRO,type="CR2",cluster=molten_df$playerNr),vcovCR(LinearRegressionPooledData2RO,type="CR2",cluster=molten_df$playerNr))
+
+
+
+tableOrderEffects<-modelsummary(list("Model 1"=LinearRegressionPooledDataRO,"Model 2"=LinearRegressionPooledData2RO),
+             metrics="all",
+             vcov=vcov_list_withOrder,
+             stars=c('*' = .05, '**' = .01,'***'=.001),
+             coef_map = c("(Intercept)"="Intercept","leader.Choice"="Qa(Leader Choice)","RPE"="RPE","leader.Choice:RPE"="RPE:Qa (Leader Choice)", "Order"="Order"),
+             gof_omit="AIC|BIC|ICC|F|RMSE|aicc|Log.Lik.|R2 Adj",
+             output="kableExtra",
+             title= "Linear response functions of second-movers (Controlling for order effects).")
+tableOrderEffects
+
+
+
+
+```
+
+#### Hypothesis 2: The likelihood that managers will act over-aggressively(have above optimal quantities) is higher in an RPE-based compensation system than in an APE-based one.
+
+#### Hypothesis 3: Managers are more likely to exhibit over-aggressive behaviour when the manager's firm is in a disadvantageous position, and an RPE-based compensation system exacerbates this effect.
+
+The following code describes test for the second hypothesis, where we estimate the likelihood of observing over-aggressive behaviour. Formally, we run logistic regressions of the form
+
+$$\text{Logit}(Pr(Y_{ij}=1))=\beta_{0}+\beta_{1}RPE+\beta_3Behind_{j}+\beta_4Behind_{j}\times RPE + \eta_{0i}$$
+
+where $RPE$ is the dummy to represent the RPE contract, and $Behind_{j}$ is a dichotomous variable showing if the leader quantity $j$ is above or below the threshold for a disadvantageous position. Our approach in establishing this threshold is similar to Lau and Leung(2010). Intuitively, if the optimal choice of the follower in response to leader quantity $j$ results in a higher payoff for the follower, then the follower is in an advantageous position. Thus, $Behind_j$ takes the value 0 for all responses to leader choices $j$ below 27 for APE and below 33 for RPE. We accommodate the panel structure of our data by including a random intercept ($\eta_{0i}$) in our models . Logistic regressions were run in R with lme4 package. We report our results along with simple linear probability models (Table 2: LPM 1-3) for the convenience of the reader along with cluster-robust standard errors (Linear probability models, while inaccurate , are helpful in illustrating the magnitude of measured effects).
+
+```{r Table 2: Hypotheses 2-3}
+
+#Linear Probability models with cluster - robust standard errors 
+lpm1<-lm(punish~APorRP,data=molten_df)
+lpm1CRSE<-sqrt(diag(vcovCR(lpm1,type="CR2",cluster=molten_df$playerNr)))
+lpm2<-lm(punish~APorRP+ahead,data=molten_df)
+lpm2CRSE<-sqrt(diag(vcovCR(lpm2,type="CR2",cluster=molten_df$playerNr)))
+lpm3<-lm(punish~APorRP+ahead+ahead:APorRP,data=molten_df)
+lpm3CRSE<-sqrt(diag(vcovCR(lpm3,type="CR2",cluster=molten_df$playerNr)))
+#stargazer(lpm1,lpm2,lpm3,type="text",
+#          se=list(lpm1CRSE,lpm2CRSE,lpm3CRSE), 
+#          no.space = TRUE)
+vcov_matrices<-list(NULL,vcovCR(lpm1,type="CR2",cluster=molten_df$playerNr),NULL,vcovCR(lpm2,type="CR2",cluster=molten_df$playerNr),NULL,vcovCR(lpm3,type="CR2",cluster=molten_df$playerNr))
+
+#Random Effects logit regressions
+RELogit1<-glmer(punish~APorRP+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+RELogit2<-glmer(punish~APorRP+ahead+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+RELogit3<-glmer(punish~APorRP+ahead+ahead:APorRP+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+#Extract logLike for each of the RE logit models
+
+
+table2<-modelsummary(list("RE Logit 1"=RELogit1,"LPM 1"=lpm1,"RE Logit 2"=RELogit2,"LPM 2"=lpm2,"RE Logit 3"=RELogit3,"LPM 3"=lpm3),
+             metrics="all",
+             vcov=vcov_matrices,
+             stars=c('*' = .05, '**' = .01,'***'=.001),
+             coef_map = c("APorRPvalueRP"="RPE","aheadbehind"="Behind","APorRPvalueRPaheadbehind"="RPE:Behind","APorRPvalueRP:aheadbehind"="RPE:Behind", '(Intercept)'    = 'Intercept'),
+             exponentiate = c(FALSE, FALSE,FALSE,FALSE, FALSE,FALSE),
+             gof_omit="R2|ICC|F|RMSE|aicc|LogLike",
+             output="kableExtra",
+             title= "Logistic regressions and Linear Probability models")
+table2  
+#to have the output in latex change output to "latex"
+
+```
+
+#### Robustness checks for Hyp.2-3 - controlling for order effects.
+
+We run logistic regressions and linear probability models from Table 2 with "Order" variable.  
+```{r order effect checks and within-subject tests}
+
+relogitRO1<-glmer(punish~APorRP+ahead+Order+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+lpmRO1<-lm(punish~APorRP+ahead+Order,data=molten_df)
+lpmRO1CRSE<-sqrt(diag(vcovCR(lpmRO1,type="CR2",cluster=molten_df$playerNr)))
+
+relogitRO2<-glmer(punish~APorRP+ahead+ahead:APorRP+Order+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+lpmRO2<-lm(punish~APorRP+ahead+ahead:APorRP+Order,data=molten_df)
+lpmRO2CRSE<-sqrt(diag(vcovCR(lpmRO2,type="CR2",cluster=molten_df$playerNr)))
+
+
+vcov_matrices2<-list(NULL,vcovCR(lpmRO1,type="CR2",cluster=molten_df$playerNr),NULL,vcovCR(lpmRO2,type="CR2",cluster=molten_df$playerNr))
+
+
+table5<-modelsummary(list("RE logit 1"=relogitRO1,"LPM 1"=lpmRO1,"RE logit 2"=relogitRO2,"LPM 2"=lpmRO2),
+                     metrics="all",
+                     vcov=vcov_matrices2,
+                     stars=c('*' = .05, '**' = .01,'***'=.001),
+                     title="Controlling for order effects",
+                     coef_map = c("APorRPvalueRP"="RPE",
+                                  "aheadbehind"="Behind",
+                                  "APorRPvalueRPaheadbehind"="RPE:Behind",
+                                  "APorRPvalueRP:aheadbehind"="RPE:Behind",
+                                  "Order"="Order",
+                                  '(Intercept)'    = 'Intercept'),
+                     gof_omit="R2|F|RMSE|aicc|ICC|Log",
+                     output="kableExtra")
+                     
+table5
+
+
+```
+
+### Robustness check: Running the same analyses on the first exposure sub-sample (i.e. employing pure between-subject comparison)
+
+```{r between-subject analysis}
+
+#Regressions on first-exposure subsample:
+LinearRegressionOnlyFirstEx<-lm(value~leader.Choice+RPE+leader.Choice:RPE,data=subset(molten_df,molten_df$Order==1))
+LinearRegressionOnlyFirstExCE<-sqrt(diag(vcovCR(LinearRegressionOnlyFirstEx,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr)))
+LinearRegressionOnlyFirstEx2<-lm(value~leader.Choice+leader.Choice:RPE,data=subset(molten_df,molten_df$Order==1))
+LinearRegressionOnlyFirstExCE2<-sqrt(diag(vcovCR(LinearRegressionOnlyFirstEx2,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr)))
+
+vcov_matrices_3<-list(vcovCR(LinearRegressionOnlyFirstEx,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr),
+                      vcovCR(LinearRegressionOnlyFirstEx2,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr))
+
+table_between_Subject_OLS<-modelsummary(list("Model 1"=LinearRegressionOnlyFirstEx,"Model 2"=LinearRegressionOnlyFirstEx2),
+             metrics="all",
+             vcov=vcov_matrices_3,
+             stars=c('*' = .05, '**' = .01,'***'=.001),
+             coef_map = c("(Intercept)"="Intercept",
+                          "leader.Choice"="Qa(Leader Choice)",
+                          "RPE"="RPE",
+                          "leader.Choice:RPE"="RPE:Qa (Leader Choice)"),
+             gof_omit="AIC|BIC|ICC|F|RMSE|aicc|Log.Lik.|R2 Adj",
+             output="kableExtra",
+             title= "Linear response functions of second-movers.(Between-subject comparison)")
+table_between_Subject_OLS
+
+
+#Linear Probability models with cluster - robust standard errors 
+lpm1_BS<-lm(punish~APorRP,data=subset(molten_df,molten_df$Order==1))
+vcvov_1bs<-vcovCR(lpm1_BS,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr)
+lpm2_BS<-lm(punish~APorRP+ahead,data=subset(molten_df,molten_df$Order==1))
+vcvov_2bs<-vcovCR(lpm2_BS,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr)
+lpm3_BS<-lm(punish~APorRP+ahead+ahead:APorRP,data=subset(molten_df,molten_df$Order==1))
+vcvov_3bs<-vcovCR(lpm3_BS,type="CR2",cluster=subset(molten_df,molten_df$Order==1)$playerNr)
+vcov_matrices_bs<-list(NULL,vcvov_1bs,NULL,vcvov_2bs,NULL,vcvov_3bs)
+
+#Random Effects logit regressions
+RELogitBS_1<-glmer(punish~APorRP+(1|playerNr),family=binomial(logit),
+                data=subset(molten_df,molten_df$Order==1),
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+RELogitBS_2<-glmer(punish~APorRP+ahead+(1|playerNr),family=binomial(logit),
+                data=subset(molten_df,molten_df$Order==1),
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+RELogitBS_3<-glmer(punish~APorRP+ahead+ahead:APorRP+(1|playerNr),family=binomial(logit),
+                data=subset(molten_df,molten_df$Order==1),
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+#Extract logLike for each of the RE logit models
+
+
+table_BS<-modelsummary(list("RE Logit 1"=RELogitBS_1,"LPM 1"=lpm1_BS,"RE Logit 2"=RELogitBS_2,"LPM 2"=lpm2_BS,"RE Logit 3"=RELogitBS_3,"LPM 3"=lpm3_BS),
+             metrics="all",
+             vcov=vcov_matrices_bs,
+             stars=c('*' = .05, '**' = .01,'***'=.001),
+             coef_map = c("APorRPvalueRP"="RPE","aheadbehind"="Behind","APorRPvalueRPaheadbehind"="RPE:Behind","APorRPvalueRP:aheadbehind"="RPE:Behind", '(Intercept)'    = 'Intercept'),
+             exponentiate = c(FALSE, FALSE,FALSE,FALSE, FALSE,FALSE),
+             gof_omit="R2|ICC|F|RMSE|aicc|LogLike",
+             output="kableExtra",
+             title= "Logistic regressions and Linear Probability models (Between-subject comparison)")
+table_BS  
+#to have the output in latex change output to "latex"
+
+
+
+```
+In the main body of the paper, we have presented the simplest general linear mixed model with random intercepts on the individual level. As a robustness check, we also run GLLMs with random coefficients for contracts ($\eta_{1i}$) and behindness ($\eta_{2i}$). Thus, the complete model could be summarised as 
+
+$$\text{Logit}(Pr(Y_{ij}=1))=\beta_{00}+(\beta_{10}+\eta_{1i})RPE + (\beta_{20}+\eta_{2i})Behind_j + \beta_3(RPE \times Behind_j)+\eta_{0i}$$ 
+
+\begin{align*}
+ \left(
+ \begin{array}{c} 
+ \begin{aligned}
+  &\beta_{0i} \\
+  &\beta_{1i} \\
+  &\beta_{2i}
+ \end{aligned}
+ \end{array}
+\right)
+ &\sim N \left(
+\left(
+ \begin{array}{c} 
+ \begin{aligned}
+  &0 \\
+  &0 \\
+  &0
+ \end{aligned}
+ \end{array}
+\right)
+, 
+\left(
+ \begin{array}{ccc}
+  \sigma^2_{\beta_{0i}} & \rho_{\beta_{0i}\beta_{1i}} & \rho_{\beta_{0i}\beta_{2i}} \\ 
+  \rho_{\beta_{1i}\beta_{0i}} & \sigma^2_{\beta_{1i}} & \rho_{\beta_{1i}\beta_{2i}} \\ 
+  \rho_{\beta_{2i}\beta_{0i}} & \rho_{\beta_{2i}\beta_{1i}} & \sigma^2_{\beta_{2i}}
+ \end{array}
+\right)
+ \right)
+ \text{, for playerNr i = 1..n}
+\end{align*}
+
+Table following table presents this model as well as its variations (i.e. including/excluding the slopes and/or the interaction term $(RPE \times Behind)$. Our conclusions from section 4 remain valid under any model specification. Including the interaction component does not significantly improve the model fit in all but one model specification. The increase in conditional probabilities of observing over-aggressive behaviour under RPE contract ranges from 10$\%$ (RE logit 2) to 13$\%$ (RE logit 6). 
+```{r Table : Different model specifications}
+#Including random slopes for the contract
+RELogit4<-glmer(punish~APorRP+ahead+(1+APorRP|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+RELogit5<-glmer(punish~APorRP+ahead+APorRP:ahead+(1+APorRP|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+#Including random slopes for the contract and aheadness
+
+RELogit6<-glmer(punish~APorRP+ahead+(1+APorRP+ahead|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+RELogit7<-glmer(punish~APorRP+ahead+APorRP:ahead+(1+APorRP+ahead|playerNr),family=binomial(logit),
+                data=molten_df,
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+
+
+table4<-modelsummary(list("RE logit 2"=RELogit2,"RE logit 3"=RELogit3,"RE logit 4"=RELogit4,"RE logit 5"=RELogit5,"RE logit 6"=RELogit6,"RE logit 7"=RELogit7),
+                     metrics="all",
+                     stars=c('*' = .05, '**' = .01,'***'=.001),
+                     coef_map = c("APorRPvalueRP"="RPE","aheadbehind"="Behind","APorRPvalueRPaheadbehind"="RPE:Behind",'(Intercept)'    = 'Intercept'),
+                     gof_omit="R2|F|RMSE|aicc|ICC|Log",
+                     output="kableExtra",
+                     title= "Additional model specifications: including random slopes on Contract and Behindness levels")
+
+
+
+```
+
+### Analysis of the downsloping group only. 
+
+```{r Exploratory analysis: downwardsloping group}
+#Focusing on the downward-sloping group only
+ReLogitDS1<-glmer(punish~APorRP+ahead+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                subset=molten_df$UPorDOWN=="down",
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+ReLogitDS2<-glmer(punish~APorRP+ahead+APorRP:ahead+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                subset=molten_df$UPorDOWN=="down",
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+LPMDS1<-lmer(punish~APorRP+ahead+(1|playerNr),data=molten_df,subset=molten_df$UPorDOWN=="down")
+LPMDS2<-lmer(punish~APorRP+ahead+APorRP:ahead+(1|playerNr),data=molten_df,subset=molten_df$UPorDOWN=="down")
+
+
+tableDS<-modelsummary(list("RE logit DS1"=ReLogitDS1,"RE logit DS2"=ReLogitDS2,"LPM DS1"=LPMDS1,"LPM DS2"=LPMDS2),
+                     metrics="all",
+                     stars=c('*' = .05, '**' = .01,'***'=.001),
+                     coef_map = c("APorRPvalueRP"="RPE","aheadbehind"="Behind","APorRPvalueRPaheadbehind"="RPE:Behind",'(Intercept)'    = 'Intercept'),
+                     gof_omit="R2|F|RMSE|aicc|ICC|Log",
+                     output="kableExtra")
+                     
+tableDS
+  
+```
+
+```{r Exploratory analysis: upward-sloping group}
+#Focusing on the upward-sloping group only
+ReLogitUS1<-glmer(punish~APorRP+ahead+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                subset=molten_df$UPorDOWN=="up",
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+
+ReLogitUS2<-glmer(punish~APorRP+ahead+APorRP:ahead+(1|playerNr),family=binomial(logit),
+                data=molten_df,
+                subset=molten_df$UPorDOWN=="up",
+                control=glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=2e5)))
+LPMUS1<-lmer(punish~APorRP+ahead+(1|playerNr),data=molten_df,subset=molten_df$UPorDOWN=="up")
+LPMUS2<-lmer(punish~APorRP+ahead+APorRP:ahead+(1|playerNr),data=molten_df,subset=molten_df$UPorDOWN=="up")
+
+
+tableUS<-modelsummary(list("RE logit US1"=ReLogitUS1,"RE logit US2"=ReLogitUS2,"LPM US1"=LPMUS1,"LPM US2"=LPMUS2),
+                     metrics="all",
+                     stars=c('*' = .05, '**' = .01,'***'=.001),
+                     coef_map = c("APorRPvalueRP"="RPE","aheadbehind"="Behind","APorRPvalueRPaheadbehind"="RPE:Behind",'(Intercept)'    = 'Intercept'),
+                     gof_omit="R2|F|RMSE|aicc|ICC|Log",
+                     output="kableExtra")
+                     
+tableUS
+
+
+```
+
+```{r looking at leader behaviour}
+
+leaderData<-melt(df[c(1,21:22)],measure.vars =2:3,value.name = "value",variable.name = "LeaderChoice") 
+
+leaderData$LeaderChoice<-ifelse(leaderData$LeaderChoice=="leaderChoiceAP", "Leader Choice AP","Leader Choice RP")
+
+leaderData %>%
+  ggplot(aes(x=as.factor(value),fill=LeaderChoice))+
+  geom_bar(position = "dodge")+
+  labs(y="Frequency", x="Leader Choice")+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12,hjust=0.5),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+
+```
+
+```{r looking at all functions}
+AllFunctionsAP<-molten_df %>%
+  filter(APorRP=="valueAP") %>%
+  ggplot(aes(colour=UPorDOWN))+
+  geom_line(aes(x=leader.Choice,y=value,group=playerNr))+
+  geom_path(data=optimalAP,group=1,size=1.5,aes(x=leader.Choice,y=valueAP,colour="Optimal strategy"))+
+  ggtitle("Observed response functions: AP contract")+
+  scale_x_continuous(name="Leader's choice",breaks = scales::pretty_breaks(n = 10))+
+  scale_y_continuous(name="Follower's Response",limits=c(0,79))+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+
+AllFunctionsRP<-molten_df %>%
+  filter(APorRP=="valueRP") %>%
+  ggplot(aes(colour=UPorDOWN))+
+  geom_line(aes(x=leader.Choice,y=value,group=playerNr))+
+   ggtitle("Observed response functions: RP contract")+
+  geom_path(data=optimalRP,group=1,size=1.5,aes(x=leader.Choice,y=valueRP,colour="Optimal strategy"))+
+  labs(y="Follower's Response", x="Leader's choice")+
+  theme(legend.title = element_blank())+
+  scale_x_continuous(name="Leader's choice",breaks = scales::pretty_breaks(n = 10))+
+  scale_y_continuous(name="Follower's Response",limits=c(0,79))+
+  theme(axis.title.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 12),
+        axis.text = element_text(color = "black", size = 10),
+        plot.title = element_text(size = 12),
+        legend.text = element_text(color = "black", size = 10),
+        legend.title =  element_blank(), 
+        panel.grid =  element_line(color = col_grid)
+        )
+
+allFunctions<-ggarrange(AllFunctionsAP,AllFunctionsRP, ncol=2, nrow=1, common.legend = TRUE, legend="bottom")
+allFunctions
+
+
+
+```
