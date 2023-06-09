@@ -1878,7 +1878,7 @@ grouping participants.</p></li>
 “DATA EXPIRED” or “Prefer not to say”. These are coded as “No
 data”)</p></li>
 </ol>
-<pre class="r"><code>fulldf&lt;-read_excel(&quot;C:/Users/galkin.WIWI/Desktop/All play 2/R Analysis Markdown/Combined_results_clean.xlsx&quot;)
+<pre class="r"><code>fulldf&lt;-read_excel(&quot;Combined_results_clean.xlsx&quot;)
 fulldf$TimeTaken&lt;-fulldf$TimeTaken/60 #Time taken in minutes
 fulldf&lt;-subset(fulldf,fulldf$Attention_Checks==&quot;TRUE&quot;) #Focusing on participants who passed attention checks
 fulldf&lt;-tibble(&quot;playerNr&quot;=fulldf$playerNr,&quot;randomOrder&quot;=fulldf$randomOrder,fulldf[grepl(&quot;firmBStrategyChoice&quot;,colnames(fulldf))],fulldf[grepl(&quot;leaderChoice&quot;,colnames(fulldf))],fulldf[grepl(&quot;attention&quot;,colnames(fulldf))],fulldf[51:58],&quot;Bonus&quot;=fulldf$Bonus)
